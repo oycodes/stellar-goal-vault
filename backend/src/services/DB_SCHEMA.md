@@ -27,6 +27,28 @@ and must not be used against production data.
 - `campaigns_fts` is a derived search index maintained by triggers. It can be
   rebuilt from `campaigns` and is never the source of truth.
 
+
+## Campaigns persistence integrity constraints (#868)
+
+`campaigns` is the source of truth for lifecycle and cached accounting. A safe
+subset of application invariants is enforced at the database layer so invalid
+rows cannot be persisted even if application validation is bypassed:
+
+| Constraint | Rule |
+| --- | --- |
+| Identity fields | non-empty `creator`, `title`, `description`, `accepted_tokens_json` |
+| Amounts | `target_amount > 0`; `pledged_amount >= 0` |
+| Timestamps | positive `deadline` and `created_at` |
+| Lifecycle | `claimed_at` and `failed_at` are mutually exclusive |
+| Cap | `max_per_contributor` is null or `>= 0` |
+
+Fresh databases receive these as `CHECK` constraints on `CREATE TABLE`. Existing
+databases receive equivalent `BEFORE INSERT/UPDATE` triggers
+(`campaigns_persistence_integrity_*`) because SQLite cannot add `CHECK` via
+`ALTER TABLE`. On migrate, negative `pledged_amount` values are soft-cleaned to
+`0` so valid accounting updates continue; other historical rows are left
+unchanged. Invalid inserts/updates are aborted.
+
 ## Migration expectations
 
 Use `CREATE TABLE/INDEX/TRIGGER IF NOT EXISTS` for new objects and guarded

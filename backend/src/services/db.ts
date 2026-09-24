@@ -125,23 +125,101 @@ export function getPledgesByContributor(
   return rows;
 }
 
+
+/**
+ * Install campaigns-persistence integrity enforcement for existing databases.
+ *
+ * SQLite cannot ADD CHECK via ALTER TABLE, so CREATE TABLE CHECKs only apply to
+ * freshly created schemas. Triggers mirror the same safe invariant subset for
+ * databases that already exist, without requiring a destructive rebuild.
+ */
+export function ensureCampaignsIntegrityConstraints(
+  database: SQLiteDatabase = getDb(),
+): void {
+  // Soft-clean cached totals that violate the non-negative invariant so later
+  // accounting UPDATEs succeed under the new rules. Do not invent target/pledge
+  // history — those are application-owned.
+  database.exec(`
+    UPDATE campaigns SET pledged_amount = 0 WHERE pledged_amount < 0;
+  `);
+
+  database.exec(`
+    CREATE TRIGGER IF NOT EXISTS campaigns_persistence_integrity_insert
+    BEFORE INSERT ON campaigns
+    FOR EACH ROW
+    BEGIN
+      SELECT CASE
+        WHEN NEW.creator IS NULL OR length(trim(NEW.creator)) = 0
+          THEN RAISE(ABORT, 'campaigns.creator must be non-empty')
+        WHEN NEW.title IS NULL OR length(trim(NEW.title)) = 0
+          THEN RAISE(ABORT, 'campaigns.title must be non-empty')
+        WHEN NEW.description IS NULL OR length(trim(NEW.description)) = 0
+          THEN RAISE(ABORT, 'campaigns.description must be non-empty')
+        WHEN NEW.accepted_tokens_json IS NULL OR length(trim(NEW.accepted_tokens_json)) = 0
+          THEN RAISE(ABORT, 'campaigns.accepted_tokens_json must be non-empty')
+        WHEN NEW.target_amount IS NULL OR NEW.target_amount <= 0
+          THEN RAISE(ABORT, 'campaigns.target_amount must be > 0')
+        WHEN NEW.pledged_amount IS NULL OR NEW.pledged_amount < 0
+          THEN RAISE(ABORT, 'campaigns.pledged_amount must be >= 0')
+        WHEN NEW.deadline IS NULL OR NEW.deadline <= 0
+          THEN RAISE(ABORT, 'campaigns.deadline must be > 0')
+        WHEN NEW.created_at IS NULL OR NEW.created_at <= 0
+          THEN RAISE(ABORT, 'campaigns.created_at must be > 0')
+        WHEN NEW.claimed_at IS NOT NULL AND NEW.failed_at IS NOT NULL
+          THEN RAISE(ABORT, 'campaigns cannot be both claimed and failed')
+        WHEN NEW.max_per_contributor IS NOT NULL AND NEW.max_per_contributor < 0
+          THEN RAISE(ABORT, 'campaigns.max_per_contributor must be >= 0')
+      END;
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS campaigns_persistence_integrity_update
+    BEFORE UPDATE ON campaigns
+    FOR EACH ROW
+    BEGIN
+      SELECT CASE
+        WHEN NEW.creator IS NULL OR length(trim(NEW.creator)) = 0
+          THEN RAISE(ABORT, 'campaigns.creator must be non-empty')
+        WHEN NEW.title IS NULL OR length(trim(NEW.title)) = 0
+          THEN RAISE(ABORT, 'campaigns.title must be non-empty')
+        WHEN NEW.description IS NULL OR length(trim(NEW.description)) = 0
+          THEN RAISE(ABORT, 'campaigns.description must be non-empty')
+        WHEN NEW.accepted_tokens_json IS NULL OR length(trim(NEW.accepted_tokens_json)) = 0
+          THEN RAISE(ABORT, 'campaigns.accepted_tokens_json must be non-empty')
+        WHEN NEW.target_amount IS NULL OR NEW.target_amount <= 0
+          THEN RAISE(ABORT, 'campaigns.target_amount must be > 0')
+        WHEN NEW.pledged_amount IS NULL OR NEW.pledged_amount < 0
+          THEN RAISE(ABORT, 'campaigns.pledged_amount must be >= 0')
+        WHEN NEW.deadline IS NULL OR NEW.deadline <= 0
+          THEN RAISE(ABORT, 'campaigns.deadline must be > 0')
+        WHEN NEW.created_at IS NULL OR NEW.created_at <= 0
+          THEN RAISE(ABORT, 'campaigns.created_at must be > 0')
+        WHEN NEW.claimed_at IS NOT NULL AND NEW.failed_at IS NOT NULL
+          THEN RAISE(ABORT, 'campaigns cannot be both claimed and failed')
+        WHEN NEW.max_per_contributor IS NOT NULL AND NEW.max_per_contributor < 0
+          THEN RAISE(ABORT, 'campaigns.max_per_contributor must be >= 0')
+      END;
+    END;
+  `);
+}
+
 function migrate(database: SQLiteDatabase): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS campaigns (
       id                    TEXT PRIMARY KEY,
-      creator               TEXT NOT NULL,
-      title                 TEXT NOT NULL,
-      description           TEXT NOT NULL,
-      accepted_tokens_json  TEXT NOT NULL,
-      target_amount         REAL NOT NULL,
-      pledged_amount        REAL NOT NULL DEFAULT 0,
-      deadline              INTEGER NOT NULL,
-      created_at            INTEGER NOT NULL,
+      creator               TEXT NOT NULL CHECK(length(trim(creator)) > 0),
+      title                 TEXT NOT NULL CHECK(length(trim(title)) > 0),
+      description           TEXT NOT NULL CHECK(length(trim(description)) > 0),
+      accepted_tokens_json  TEXT NOT NULL CHECK(length(trim(accepted_tokens_json)) > 0),
+      target_amount         REAL NOT NULL CHECK(target_amount > 0),
+      pledged_amount        REAL NOT NULL DEFAULT 0 CHECK(pledged_amount >= 0),
+      deadline              INTEGER NOT NULL CHECK(deadline > 0),
+      created_at            INTEGER NOT NULL CHECK(created_at > 0),
       claimed_at            INTEGER,
       failed_at             INTEGER,
       deleted_at            INTEGER,
       metadata_json         TEXT,
-      max_per_contributor   INTEGER
+      max_per_contributor   INTEGER CHECK(max_per_contributor IS NULL OR max_per_contributor >= 0),
+      CHECK(claimed_at IS NULL OR failed_at IS NULL)
     );
 
     CREATE INDEX IF NOT EXISTS idx_campaigns_creator ON campaigns(creator);
@@ -373,6 +451,10 @@ function migrate(database: SQLiteDatabase): void {
   // Query-layer indexes: composite plans for contributor/refund lookups,
   // campaign event history pages, and soft-deleted comment lists.
   ensureQueryLayerIndexes(database);
+
+  // Campaigns persistence integrity: CHECK on fresh tables + triggers for
+  // existing DBs (SQLite cannot ADD CHECK via ALTER TABLE).
+  ensureCampaignsIntegrityConstraints(database);
 }
 
 /**
